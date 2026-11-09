@@ -13,6 +13,18 @@ jobs:
           mv main.dart lib/
           mv patch_android.py tool/
           mv server.js package.json server/
+      - name: Force newer Android SDK for all libraries
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/sdk.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.hasProperty('android')) {
+                p.android.compileSdkVersion 36
+              }
+            }
+          }
+          EOF
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
