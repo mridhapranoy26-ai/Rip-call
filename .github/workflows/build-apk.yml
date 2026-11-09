@@ -7,6 +7,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Arrange files
+        run: |
+          mkdir -p lib tool server
+          mv main.dart lib/
+          mv patch_android.py tool/
+          mv server.js package.json server/
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
