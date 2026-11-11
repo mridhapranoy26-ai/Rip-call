@@ -1,1 +1,1 @@
-{"name":"ip-calling-signaling","version":"1.0.0","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"ws":"^8.18.0"}}
+{"name":"ip-calling-signaling","version":"2.0.0","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"ws":"^8.18.0","pg":"^8.13.0","firebase-admin":"^12.6.0"}}

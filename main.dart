@@ -3,12 +3,21 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 enum CS { idle, calling, incoming, connecting, connected }
+
+// ---- Firebase settings: fill these 4 values (see SETUP.md). Leave empty to disable push. ----
+const fbApiKey = '';
+const fbAppId = '';
+const fbSenderId = '';
+const fbProjectId = '';
 
 String fmt(int s) => '${(s ~/ 60).toString().padLeft(2, '0')}:${(s % 60).toString().padLeft(2, '0')}';
 
@@ -24,6 +33,14 @@ class Svc extends ChangeNotifier {
   RTCPeerConnection? pc;
   MediaStream? local;
   final pend = <RTCIceCandidate>[];
+  final lr = RTCVideoRenderer(), rr = RTCVideoRenderer();
+  bool video = false, camOn = true;
+  Timer? noAns;
+  String? fcmToken, callCode;
+  SimpleKeyPair? kp;
+  String myPk = '';
+  final keyWaiters = <String, Completer<String?>>{};
+  List<Map<String, dynamic>> chats = [];
   List<Map<String, dynamic>> history = [], contacts = [];
 
   List<Map<String, dynamic>> _load(String k) =>
@@ -37,11 +54,22 @@ class Svc extends ChangeNotifier {
     url = p.getString('url') ?? url;
     history = _load('history');
     contacts = _load('contacts');
+    chats = _load('chatidx');
+    await lr.initialize();
+    await rr.initialize();
+    await _initKeys();
     connect();
+    _initFirebase();
   }
 
   Future<void> connect() async {
     ws?.sink.close();
+    if (!url.startsWith('wss://')) {
+      online = false;
+      notice = 'Server address must start with wss:// (encrypted)';
+      notifyListeners();
+      return;
+    }
     WebSocketChannel? c;
     try {
       c = WebSocketChannel.connect(Uri.parse(url));
@@ -54,7 +82,8 @@ class Svc extends ChangeNotifier {
     if (ws != c) return;
     online = true;
     notifyListeners();
-    c.sink.add(jsonEncode({'t': 'reg', 'id': myId}));
+    c.sink.add(jsonEncode({'t': 'reg', 'id': myId, 'pk': myPk}));
+    _regTok();
     c.stream.listen((d) => _on(jsonDecode(d as String) as Map<String, dynamic>),
         onDone: () => _lost(c!), onError: (_) => _lost(c!));
   }
@@ -68,32 +97,134 @@ class Svc extends ChangeNotifier {
 
   void send(Map<String, dynamic> m) => ws?.sink.add(jsonEncode(m));
 
+  Future<void> _initFirebase() async {
+    if (fbApiKey.isEmpty) return;
+    try {
+      await Firebase.initializeApp(
+          options: const FirebaseOptions(apiKey: fbApiKey, appId: fbAppId, messagingSenderId: fbSenderId, projectId: fbProjectId));
+      final m = FirebaseMessaging.instance;
+      await m.requestPermission();
+      fcmToken = await m.getToken();
+      m.onTokenRefresh.listen((t) { fcmToken = t; _regTok(); });
+      _regTok();
+    } catch (_) {}
+  }
+
+  void _regTok() { if (fcmToken != null) send({'t': 'tok', 'token': fcmToken}); }
+
+  List<Map<String, dynamic>> thread(String peer) =>
+      (jsonDecode(p.getString('chat_$peer') ?? '[]') as List).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+
+  void _store(String peer, bool me, String text) {
+    final l = thread(peer)..add({'me': me, 'text': text, 'ts': DateTime.now().toIso8601String()});
+    if (l.length > 500) l.removeRange(0, l.length - 500);
+    p.setString('chat_$peer', jsonEncode(l));
+    chats.removeWhere((e) => e['peer'] == peer);
+    chats.insert(0, {'peer': peer, 'last': text, 'ts': DateTime.now().toIso8601String()});
+    _save('chatidx', chats);
+    notifyListeners();
+  }
+
+  Future<void> _initKeys() async {
+    var seed = p.getString('sk');
+    if (seed == null) {
+      final r = Random.secure();
+      seed = base64Encode(List<int>.generate(32, (_) => r.nextInt(256)));
+      await p.setString('sk', seed);
+    }
+    kp = await X25519().newKeyPairFromSeed(base64Decode(seed));
+    myPk = base64Encode((await kp!.extractPublicKey()).bytes);
+  }
+
+  Future<String?> _peerKey(String peer) async {
+    final pinned = p.getString('pk_$peer');
+    if (pinned != null) return pinned;
+    final w = keyWaiters.putIfAbsent(peer, () => Completer<String?>());
+    send({'t': 'getkey', 'to': peer});
+    final pk = await w.future.timeout(const Duration(seconds: 8), onTimeout: () => null);
+    keyWaiters.remove(peer);
+    if (pk == null) return null;
+    await p.setString('pk_$peer', pk);
+    return pk;
+  }
+
+  Future<SecretKey> _shared(String peerPk) async {
+    final sec = await X25519().sharedSecretKey(
+        keyPair: kp!, remotePublicKey: SimplePublicKey(base64Decode(peerPk), type: KeyPairType.x25519));
+    return Hkdf(hmac: Hmac.sha256(), outputLength: 32).deriveKey(secretKey: sec, nonce: utf8.encode('ipcalling-v1'));
+  }
+
+  Future<String?> sendMsg(String peer, String text) async {
+    if (!online) return 'Not connected to server';
+    try {
+      final pk = await _peerKey(peer);
+      if (pk == null) return 'Security key unavailable for $peer (unknown ID?)';
+      final box = await AesGcm.with256bits().encrypt(utf8.encode(text),
+          secretKey: await _shared(pk), aad: utf8.encode('$myId>$peer'));
+      send({'t': 'msg', 'to': peer, 'c': base64Encode(box.concatenation())});
+      _store(peer, true, text);
+      return null;
+    } catch (_) {
+      return 'Encryption failed';
+    }
+  }
+
+  Future<void> _recv(String from, String c) async {
+    var text = '[unreadable message]';
+    try {
+      final pk = await _peerKey(from);
+      if (pk != null) {
+        final box = SecretBox.fromConcatenation(base64Decode(c), nonceLength: 12, macLength: 16);
+        text = utf8.decode(await AesGcm.with256bits().decrypt(box, secretKey: await _shared(pk), aad: utf8.encode('$from>$myId')));
+      }
+    } catch (_) {}
+    _store(from, false, text);
+  }
+
+  Future<String> safety(String a, String b) async {
+    final l = [a, b]..sort();
+    final h = (await Sha256().hash(utf8.encode(l.join('|')))).bytes;
+    return List.generate(6, (i) => (((h[2 * i] << 8) | h[2 * i + 1]) % 10000).toString().padLeft(4, '0')).join(' ');
+  }
+
+  Future<void> _calcCode() async {
+    try {
+      final re = RegExp(r'a=fingerprint:\S+ ([0-9A-Fa-f:]+)');
+      final l = (await pc?.getLocalDescription())?.sdp, r = (await pc?.getRemoteDescription())?.sdp;
+      final fa = re.firstMatch(l ?? '')?.group(1), fb = re.firstMatch(r ?? '')?.group(1);
+      if (fa != null && fb != null) { callCode = await safety(fa, fb); notifyListeners(); }
+    } catch (_) {}
+  }
+
   String nameFor(String id) {
     for (final c in contacts) { if (c['id'] == id) return c['name'] as String; }
     return '';
   }
 
-  Future<bool> _perm() async {
-    final r = await [Permission.microphone, Permission.notification, Permission.bluetoothConnect].request();
-    return r[Permission.microphone]?.isGranted ?? false;
+  Future<bool> _perm({bool v = false}) async {
+    final r = await [Permission.microphone, Permission.notification, Permission.bluetoothConnect, if (v) Permission.camera].request();
+    return (r[Permission.microphone]?.isGranted ?? false) && (!v || (r[Permission.camera]?.isGranted ?? false));
   }
 
-  Future<String?> call(String to) async {
+  Future<String?> call(String to, {bool video = false}) async {
     if (to.isEmpty) return 'Enter a calling ID';
     if (to == myId) return 'That is your own ID';
     if (!online) return 'Not connected to server';
     if (state != CS.idle) return 'Already in a call';
-    if (!await _perm()) return 'Microphone permission needed';
+    if (!await _perm(v: video)) return 'Microphone/camera permission needed';
+    this.video = video;
     peer = to; wasIncoming = false; answered = false; declined = false; notice = null;
     state = CS.calling;
-    send({'t': 'invite', 'to': to});
+    send({'t': 'invite', 'to': to, 'v': video});
+    noAns?.cancel();
+    noAns = Timer(const Duration(seconds: 45), () { if (state == CS.calling) { notice = 'No answer'; hangup(); } });
     notifyListeners();
     return null;
   }
 
   Future<void> accept() async {
     ringT?.cancel();
-    if (!await _perm()) { reject(); return; }
+    if (!await _perm(v: video)) { reject(); return; }
     answered = true; state = CS.connecting;
     send({'t': 'accept', 'to': peer});
     notifyListeners();
@@ -115,14 +246,14 @@ class Svc extends ChangeNotifier {
     switch (t) {
       case 'invite':
         if (state != CS.idle) { send({'t': 'reject', 'to': from}); return; }
-        peer = from!; wasIncoming = true; answered = false; declined = false; notice = null;
+        peer = from!; wasIncoming = true; answered = false; declined = false; notice = null; video = m['v'] == true;
         state = CS.incoming; _ring(); notifyListeners();
         break;
       case 'accept':
         if (from == peer && state == CS.calling) {
           answered = true; state = CS.connecting; notifyListeners();
           await _pc();
-          final o = await pc!.createOffer({'offerToReceiveAudio': 1});
+          final o = await pc!.createOffer({'offerToReceiveAudio': 1, 'offerToReceiveVideo': video ? 1 : 0});
           await pc!.setLocalDescription(o);
           send({'t': 'offer', 'to': peer, 'sdp': o.sdp});
         }
@@ -154,6 +285,17 @@ class Svc extends ChangeNotifier {
       case 'offline':
         if (state == CS.calling) { notice = '$peer is offline'; _finish(); }
         break;
+      case 'key':
+        final w = keyWaiters[from ?? ''];
+        if (w != null && !w.isCompleted) w.complete(m['pk'] as String?);
+        break;
+      case 'err':
+        notice = m['msg'] as String?;
+        notifyListeners();
+        break;
+      case 'msg':
+        if (from != null && m['c'] is String) _recv(from, m['c'] as String);
+        break;
       case 'bye':
         if (from == peer) _finish();
         break;
@@ -167,12 +309,14 @@ class Svc extends ChangeNotifier {
   }
 
   Future<void> _pc() async {
-    local = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    local = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': video ? {'facingMode': 'user'} : false});
+    lr.srcObject = local;
     final ice = <Map<String, dynamic>>[{'urls': 'stun:stun.l.google.com:19302'}];
     final tu = p.getString('turn') ?? '';
     if (tu.isNotEmpty) ice.add({'urls': tu, 'username': p.getString('tuser') ?? '', 'credential': p.getString('tpass') ?? ''});
     pc = await createPeerConnection({'iceServers': ice, 'sdpSemantics': 'unified-plan'});
-    for (final t in local!.getAudioTracks()) { await pc!.addTrack(t, local!); }
+    for (final t in local!.getTracks()) { await pc!.addTrack(t, local!); }
+    pc!.onTrack = (e) { if (e.streams.isNotEmpty) { rr.srcObject = e.streams[0]; notifyListeners(); } };
     pc!.onIceCandidate = (c) {
       if (c.candidate != null) send({'t': 'ice', 'to': peer, 'c': c.toMap()});
     };
@@ -180,7 +324,7 @@ class Svc extends ChangeNotifier {
       if (s == RTCPeerConnectionState.RTCPeerConnectionStateConnected && state != CS.connected) {
         state = CS.connected; t0 = DateTime.now();
         ticker = Timer.periodic(const Duration(seconds: 1), (_) => notifyListeners());
-        setRoute('earpiece');
+        setRoute(video ? 'speaker' : 'earpiece'); noAns?.cancel(); _calcCode();
       } else if (s == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
         notice = 'Connection lost'; hangup();
       }
@@ -203,6 +347,17 @@ class Svc extends ChangeNotifier {
     notifyListeners();
   }
 
+  void toggleCam() {
+    camOn = !camOn;
+    for (final t in local?.getVideoTracks() ?? <MediaStreamTrack>[]) { t.enabled = camOn; }
+    notifyListeners();
+  }
+
+  void switchCam() {
+    final t = local?.getVideoTracks() ?? <MediaStreamTrack>[];
+    if (t.isNotEmpty) Helper.switchCamera(t.first);
+  }
+
   void _finish() {
     if (state == CS.idle) return;
     final dur = t0 == null ? 0 : DateTime.now().difference(t0!).inSeconds;
@@ -210,7 +365,8 @@ class Svc extends ChangeNotifier {
     history.insert(0, {'peer': peer, 'dir': dir, 'ts': DateTime.now().toIso8601String(), 'dur': dur});
     if (history.length > 200) history.removeLast();
     _save('history', history);
-    ticker?.cancel(); ringT?.cancel(); t0 = null;
+    ticker?.cancel(); ringT?.cancel(); noAns?.cancel(); t0 = null;
+    rr.srcObject = null; lr.srcObject = null; video = false; camOn = true; callCode = null;
     pc?.close(); pc = null;
     for (final t in local?.getTracks() ?? <MediaStreamTrack>[]) { t.stop(); }
     local?.dispose(); local = null;
@@ -325,6 +481,7 @@ class Home extends StatelessWidget {
                 Expanded(
                     child: GridView.count(crossAxisCount: 2, children: [
                   tile(c, Icons.dialpad, 'Dialer', const Dialer()),
+                  tile(c, Icons.chat, 'Chats', const Chats()),
                   tile(c, Icons.contacts, 'Contacts', const Contacts()),
                   tile(c, Icons.history, 'Call History', const History()),
                   tile(c, Icons.settings, 'Settings', const Settings()),
@@ -355,7 +512,13 @@ class _DialerState extends State<Dialer> {
         Padding(
             padding: const EdgeInsets.only(bottom: 24),
             child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-              const SizedBox(width: 56),
+              IconButton(
+                  iconSize: 36,
+                  onPressed: () async {
+                    final e = await svc.call(n, video: true);
+                    if (e != null && context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e)));
+                  },
+                  icon: const Icon(Icons.videocam, color: Colors.blue)),
               FloatingActionButton.large(
                   backgroundColor: Colors.green,
                   onPressed: () async {
@@ -424,6 +587,7 @@ class _ContactsState extends State<Contacts> {
                                 title: Text(e['name'] as String),
                                 subtitle: Text(e['id'] as String),
                                 onLongPress: () => svc.removeContact(e),
+                                onTap: () => Navigator.push(c, MaterialPageRoute(builder: (_) => ChatPage(e['id'] as String))),
                                 trailing: IconButton(
                                     icon: const Icon(Icons.call, color: Colors.green),
                                     onPressed: () async {
@@ -504,7 +668,7 @@ class IncomingScreen extends StatelessWidget {
         backgroundColor: const Color(0xFF1565C0),
         body: SafeArea(
             child: Column(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
-          const Text('Incoming call', style: TextStyle(color: Colors.white70, fontSize: 20)),
+          Text(svc.video ? 'Incoming video call' : 'Incoming call', style: const TextStyle(color: Colors.white70, fontSize: 20)),
           Column(children: [
             const Icon(Icons.account_circle, size: 110, color: Colors.white),
             Text(n.isEmpty ? svc.peer : n, style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.bold)),
@@ -520,6 +684,40 @@ class IncomingScreen extends StatelessWidget {
 
 class CallScreen extends StatelessWidget {
   const CallScreen({super.key});
+  Widget _videoUi(Svc s) {
+    final status = s.state == CS.connected
+        ? fmt(DateTime.now().difference(s.t0 ?? DateTime.now()).inSeconds)
+        : (s.state == CS.calling ? 'Calling...' : 'Connecting...');
+    return Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(children: [
+          Positioned.fill(child: RTCVideoView(s.rr, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)),
+          Positioned(
+              right: 16, top: 48, width: 110, height: 150,
+              child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: RTCVideoView(s.lr, mirror: true, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover))),
+          Positioned(
+              left: 16, top: 48,
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(s.peer, style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
+                Text(status, style: const TextStyle(color: Colors.white70)),
+                if (s.callCode != null) Text('Security code: ${s.callCode}', style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              ])),
+          Positioned(
+              left: 0, right: 0, bottom: 40,
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                IconButton.filledTonal(onPressed: s.toggleMute, icon: Icon(s.muted ? Icons.mic_off : Icons.mic)),
+                IconButton.filledTonal(onPressed: s.toggleCam, icon: Icon(s.camOn ? Icons.videocam : Icons.videocam_off)),
+                IconButton.filledTonal(onPressed: s.switchCam, icon: const Icon(Icons.cameraswitch)),
+                IconButton.filledTonal(
+                    onPressed: () => s.setRoute(s.route == 'speaker' ? 'earpiece' : 'speaker'),
+                    icon: Icon(s.route == 'speaker' ? Icons.volume_up : Icons.phone_in_talk)),
+                FloatingActionButton(backgroundColor: Colors.red, onPressed: s.hangup, child: const Icon(Icons.call_end, color: Colors.white)),
+              ])),
+        ]));
+  }
+
   Widget r(String k, IconData i, String l) {
     final sel = svc.route == k;
     return Column(children: [
@@ -531,6 +729,7 @@ class CallScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = svc;
+    if (s.video) return _videoUi(s);
     final status = s.state == CS.calling
         ? 'Calling...'
         : s.state == CS.connecting
@@ -544,6 +743,7 @@ class CallScreen extends StatelessWidget {
         const Icon(Icons.account_circle, size: 100),
         Text(n.isEmpty ? s.peer : n, style: const TextStyle(fontSize: 30, fontWeight: FontWeight.bold)),
         Text(status, style: const TextStyle(fontSize: 20)),
+        if (s.callCode != null) Text('Security code: ${s.callCode}', style: const TextStyle(fontSize: 13, color: Colors.black54)),
       ]),
       Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
         r('speaker', Icons.volume_up, 'Speaker'),
@@ -556,5 +756,124 @@ class CallScreen extends StatelessWidget {
       ]),
       FloatingActionButton.large(backgroundColor: Colors.red, onPressed: s.hangup, child: const Icon(Icons.call_end, color: Colors.white)),
     ])));
+  }
+}
+
+class Chats extends StatelessWidget {
+  const Chats({super.key});
+  void _new(BuildContext c) {
+    final ic = TextEditingController();
+    showDialog(
+        context: c,
+        builder: (dc) => AlertDialog(
+              title: const Text('New chat'),
+              content: TextField(controller: ic, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Calling ID')),
+              actions: [
+                TextButton(
+                    onPressed: () {
+                      final id = ic.text.trim();
+                      Navigator.pop(dc);
+                      if (id.isNotEmpty) Navigator.push(c, MaterialPageRoute(builder: (_) => ChatPage(id)));
+                    },
+                    child: const Text('Open')),
+              ],
+            ));
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+      appBar: AppBar(title: const Text('Chats')),
+      floatingActionButton: FloatingActionButton(onPressed: () => _new(context), child: const Icon(Icons.edit)),
+      body: ListenableBuilder(
+          listenable: svc,
+          builder: (c, _) => ListView(
+              children: svc.chats.map((e) {
+            final id = e['peer'] as String;
+            final n = svc.nameFor(id);
+            return ListTile(
+              leading: const Icon(Icons.account_circle, size: 40),
+              title: Text(n.isEmpty ? id : n),
+              subtitle: Text(e['last'] as String, maxLines: 1, overflow: TextOverflow.ellipsis),
+              onTap: () => Navigator.push(c, MaterialPageRoute(builder: (_) => ChatPage(id))),
+            );
+          }).toList())));
+}
+
+class ChatPage extends StatefulWidget {
+  final String peer;
+  const ChatPage(this.peer, {super.key});
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  final tc = TextEditingController();
+  void _snack(String t) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  Future<void> _call(bool v) async {
+    final e = await svc.call(widget.peer, video: v);
+    if (e != null && mounted) _snack(e);
+  }
+
+  Future<void> _send() async {
+    final t = tc.text.trim();
+    if (t.isEmpty) return;
+    tc.clear();
+    final e = await svc.sendMsg(widget.peer, t);
+    if (e != null && mounted) { tc.text = t; _snack(e); }
+  }
+
+  Future<void> _showCode() async {
+    final pk = await svc._peerKey(widget.peer);
+    final code = pk == null ? null : await svc.safety(svc.myPk, pk);
+    if (!mounted) return;
+    showDialog(
+        context: context,
+        builder: (_) => AlertDialog(
+              title: const Text('Security code'),
+              content: Text(code == null
+                  ? 'Key not available yet'
+                  : '$code\n\nYour contact sees the same code on their screen. If the codes match, nobody is intercepting this chat.'),
+              actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+            ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final n = svc.nameFor(widget.peer);
+    return Scaffold(
+        appBar: AppBar(title: Text(n.isEmpty ? widget.peer : n), actions: [
+          IconButton(icon: const Icon(Icons.lock_outline), onPressed: _showCode),
+          IconButton(icon: const Icon(Icons.call), onPressed: () => _call(false)),
+          IconButton(icon: const Icon(Icons.videocam), onPressed: () => _call(true)),
+        ]),
+        body: ListenableBuilder(
+            listenable: svc,
+            builder: (c, _) {
+              final l = svc.thread(widget.peer).reversed.toList();
+              return Column(children: [
+                Expanded(
+                    child: ListView(
+                        reverse: true,
+                        padding: const EdgeInsets.all(12),
+                        children: l
+                            .map((m) => Align(
+                                alignment: m['me'] == true ? Alignment.centerRight : Alignment.centerLeft,
+                                child: Container(
+                                    margin: const EdgeInsets.symmetric(vertical: 3),
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                        color: m['me'] == true ? Theme.of(c).colorScheme.primaryContainer : Colors.grey.shade200,
+                                        borderRadius: BorderRadius.circular(12)),
+                                    child: Text(m['text'] as String))))
+                            .toList())),
+                SafeArea(
+                    child: Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Row(children: [
+                          Expanded(child: TextField(controller: tc, decoration: const InputDecoration(hintText: 'Message', border: OutlineInputBorder()))),
+                          IconButton(icon: const Icon(Icons.send), onPressed: _send),
+                        ]))),
+              ]);
+            }));
   }
 }
